@@ -1,0 +1,26 @@
+name: checks
+on: [push, pull_request]
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: tenantkit
+          POSTGRES_DB: tenantkit
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    env:
+      TENANTKIT_TEST_DATABASE_URL: postgresql+asyncpg://postgres:tenantkit@localhost:5432/tenantkit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -e '.[dev]'
+      - run: ruff check .
+      - run: mypy
+      - run: pytest --cov=tenantkit --cov-fail-under=90
