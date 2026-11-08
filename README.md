@@ -4,6 +4,20 @@ Async, framework-agnostic multi-tenancy, authentication and scoped impersonation
 
 Install `pip install tenantkit` or `pip install 'tenantkit[sqlalchemy]'` for the async SQLAlchemy adapter. The host supplies keys, settings, database sessions and HTTP integration. The package reads no environment variables or files.
 
+Install directly from GitHub (requires Git):
+
+```bash
+python -m pip install "tenantkit @ git+https://github.com/YogeshUpdhyay/tenantkit.git@main"
+```
+
+With the async SQLAlchemy adapter:
+
+```bash
+python -m pip install "tenantkit[sqlalchemy] @ git+https://github.com/YogeshUpdhyay/tenantkit.git@main"
+```
+
+Replace `main` with a tag or full commit SHA to pin a specific version.
+
 ```python
 from secrets import token_urlsafe
 from tenantkit import TenantKit, TenantKitConfig
