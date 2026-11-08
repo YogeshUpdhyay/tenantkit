@@ -94,16 +94,22 @@ class _LoginAttempts:
         return deepcopy(self.rows.get((subject_type, subject_id)))
 
     async def record_failure(
-        self, subject_type: str, subject_id: UUID, *, locked_until: datetime | None = None
+        self, subject_type: str, subject_id: UUID, *, max_attempts: int, locked_until: datetime
     ) -> LoginAttempt:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
         async with self.storage.transaction():
             key = (subject_type, subject_id)
             old = self.rows.get(key)
+            count = (old.failed_count if old else 0) + 1
+            until = old.locked_until if old else None
+            if until is None and count >= max_attempts:
+                until = locked_until
             value = LoginAttempt(
                 subject_type=subject_type,
                 subject_id=subject_id,
-                failed_count=(old.failed_count if old else 0) + 1,
-                locked_until=locked_until,
+                failed_count=count,
+                locked_until=until,
             )
             self.rows[key] = value
             return deepcopy(value)

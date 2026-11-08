@@ -44,16 +44,13 @@ class PasswordProvider:
         if len(password) > settings.password.max_length or not self.hashing.verify(
             subject.password_hash, password
         ):
-            count = (attempt.failed_count if attempt else 0) + 1
-            locked = (
-                now + timedelta(minutes=settings.lockout.lock_minutes)
-                if count >= settings.lockout.max_attempts
-                else None
+            recorded = await self.storage.login_attempts.record_failure(
+                request.subject_type,
+                subject.id,
+                max_attempts=settings.lockout.max_attempts,
+                locked_until=now + timedelta(minutes=settings.lockout.lock_minutes),
             )
-            await self.storage.login_attempts.record_failure(
-                request.subject_type, subject.id, locked_until=locked
-            )
-            return AuthResult("failure", reason="locked" if locked else None)
+            return AuthResult("failure", reason="locked" if recorded.locked_until else None)
         await self.storage.login_attempts.reset(request.subject_type, subject.id)
         if self.hashing.hasher.check_needs_rehash(subject.password_hash):
             subject.password_hash = self.hashing.hash(password)

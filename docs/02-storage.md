@@ -53,6 +53,14 @@ class Storage(Protocol):
     async def health_check(self) -> None: ...
 ```
 
+`LoginAttemptRepository.record_failure(subject_type, subject_id, *, max_attempts,
+locked_until)` atomically increments the stored count and sets the lock when that count
+reaches `max_attempts`. `locked_until` is the candidate expiry, even below the threshold.
+The returned `LoginAttempt` contains the stored count and lock expiry; providers must
+use that row for their lock decision. A failure preserves an existing lock. A threshold
+of one locks on the first insert. Custom adapters must implement this contract; no
+schema migration is required.
+
 - Services receive a `Storage` object and never import an adapter.
 - No hard deletes in v1: deactivation sets `is_active` to false.
 - Duplicate keys raise `AlreadyExistsError`. Missing records return `None`, and services decide whether that is an error.

@@ -22,6 +22,7 @@ from sqlalchemy import (
     String,
     Table,
     delete,
+    case,
     insert,
     select,
     text,
@@ -223,63 +224,78 @@ class _Attempts:
             )
 
     async def record_failure(
-        self, subject_type: str, subject_id: UUID, *, locked_until: datetime | None = None
+        self, subject_type: str, subject_id: UUID, *, max_attempts: int, locked_until: datetime
     ) -> LoginAttempt:
-        async with self.storage.transaction():
-            async with self.storage._session() as session:
-                condition = self._where(subject_type, subject_id)
-                dialect = session.get_bind().dialect.name
-                if dialect in {"sqlite", "postgresql"}:
-                    if dialect == "sqlite":
-                        from sqlalchemy.dialects.sqlite import insert as upsert
-                    else:
-                        from sqlalchemy.dialects.postgresql import insert as upsert
-                    stmt = upsert(self.table).values(
-                        subject_type=subject_type,
-                        subject_id=str(subject_id),
-                        failed_count=1,
-                        locked_until=locked_until,
-                    )
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=["subject_type", "subject_id"],
-                        set_={
-                            "failed_count": self.table.c.failed_count + 1,
-                            "locked_until": locked_until,
-                        },
-                    ).returning(self.table.c.failed_count)
-                    count = (await session.execute(stmt)).scalar_one()
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
+        initial_lock = locked_until if max_attempts == 1 else None
+        async with self.storage._session() as session:
+            condition = self._where(subject_type, subject_id)
+            dialect = session.get_bind().dialect.name
+            if dialect in {"sqlite", "postgresql"}:
+                if dialect == "sqlite":
+                    from sqlalchemy.dialects.sqlite import insert as upsert
                 else:
-                    previous = (
-                        (
-                            await session.execute(
-                                select(self.table).where(condition).with_for_update()
-                            )
-                        )
-                        .mappings()
-                        .first()
-                    )
-                    count = (previous["failed_count"] if previous else 0) + 1
-                    if previous:
-                        await session.execute(
-                            update(self.table)
-                            .where(condition)
-                            .values(failed_count=count, locked_until=locked_until)
-                        )
-                    else:
-                        await session.execute(
-                            insert(self.table).values(
-                                subject_type=subject_type,
-                                subject_id=str(subject_id),
-                                failed_count=count,
-                                locked_until=locked_until,
-                            )
-                        )
-                return LoginAttempt(
+                    from sqlalchemy.dialects.postgresql import insert as upsert
+                stmt = upsert(self.table).values(
                     subject_type=subject_type,
-                    subject_id=subject_id,
-                    failed_count=count,
-                    locked_until=locked_until,
+                    subject_id=str(subject_id),
+                    failed_count=1,
+                    locked_until=initial_lock,
                 )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["subject_type", "subject_id"],
+                    set_={
+                        "failed_count": self.table.c.failed_count + 1,
+                        "locked_until": case(
+                            (self.table.c.locked_until.is_not(None), self.table.c.locked_until),
+                            (self.table.c.failed_count + 1 >= max_attempts, locked_until),
+                            else_=self.table.c.locked_until,
+                        ),
+                    },
+                ).returning(self.table.c.failed_count, self.table.c.locked_until)
+                row = (await session.execute(stmt)).mappings().one()
+                count, until = row["failed_count"], row["locked_until"]
+            else:
+                # A savepoint lets a losing first-insert race continue safely.
+                query = select(self.table).where(condition).with_for_update()
+                previous = (await session.execute(query)).mappings().first()
+                if previous is None:
+                    try:
+                        async with session.begin_nested():
+                            await session.execute(
+                                insert(self.table).values(
+                                    subject_type=subject_type,
+                                    subject_id=str(subject_id),
+                                    failed_count=1,
+                                    locked_until=initial_lock,
+                                )
+                            )
+                    except IntegrityError:
+                        previous = (await session.execute(query)).mappings().one()
+                if previous is not None:
+                    count = previous["failed_count"] + 1
+                    until = previous["locked_until"]
+                    if until is None and count >= max_attempts:
+                        until = locked_until
+                    await session.execute(
+                        update(self.table)
+                        .where(condition)
+                        .values(
+                            failed_count=count,
+                            locked_until=until,
+                        )
+                    )
+                else:
+                    count, until = 1, initial_lock
+            if until is not None and until.tzinfo is None:
+                until = until.replace(tzinfo=timezone.utc)
+            return LoginAttempt(
+                subject_type=subject_type,
+                subject_id=subject_id,
+                failed_count=count,
+                locked_until=until,
+            )
 
     async def reset(self, subject_type: str, subject_id: UUID) -> None:
         async with self.storage._session() as session:

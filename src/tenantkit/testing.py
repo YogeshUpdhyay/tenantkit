@@ -3,6 +3,9 @@
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from dataclasses import replace
+import asyncio
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import pytest
 
@@ -71,3 +74,32 @@ class StorageContract:
                     await storage.tenants.create(Tenant(slug="rollback"))
                     raise RuntimeError("abort")
             assert await storage.tenants.get_by_slug("rollback") is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("subject_type", ["admin", "tenant_user"])
+    @pytest.mark.parametrize("max_attempts", [1, 5])
+    async def test_concurrent_failures_lock_atomically(
+        self, subject_type: str, max_attempts: int
+    ) -> None:
+        async with self.storage() as storage:
+            identity = uuid4()
+            until = datetime.now(timezone.utc) + timedelta(minutes=15)
+            rows = await asyncio.gather(
+                *[
+                    storage.login_attempts.record_failure(
+                        subject_type, identity, max_attempts=max_attempts, locked_until=until
+                    )
+                    for _ in range(12)
+                ]
+            )
+            attempt = await storage.login_attempts.get(subject_type, identity)
+            assert attempt is not None
+            assert attempt.failed_count == 12
+            assert attempt.locked_until == until
+            assert sum(row.locked_until is not None for row in rows) == 13 - max_attempts
+            # A stale caller with a higher threshold cannot clear an existing lock.
+            later = await storage.login_attempts.record_failure(
+                subject_type, identity, max_attempts=100, locked_until=until
+            )
+            assert later.failed_count == 13
+            assert later.locked_until == until

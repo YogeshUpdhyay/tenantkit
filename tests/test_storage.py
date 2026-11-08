@@ -1,5 +1,7 @@
 import asyncio
 import os
+import tempfile
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -33,8 +35,18 @@ async def test_global_user_email_unique():
 async def test_attempt_increment_and_reset():
     storage = InMemoryStorage()
     identity = uuid4()
-    await storage.login_attempts.record_failure("admin", identity)
-    attempt = await storage.login_attempts.record_failure("admin", identity)
+    await storage.login_attempts.record_failure(
+        "admin",
+        identity,
+        max_attempts=5,
+        locked_until=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+    attempt = await storage.login_attempts.record_failure(
+        "admin",
+        identity,
+        max_attempts=5,
+        locked_until=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
     assert attempt.failed_count == 2
     await storage.login_attempts.reset("admin", identity)
     assert await storage.login_attempts.get("admin", identity) is None
@@ -49,7 +61,11 @@ class TestSqlAlchemyStorage(StorageContract):
 
         if self.database_url.startswith("sqlite") and os.getenv("TENANTKIT_SKIP_SQLITE") == "1":
             pytest.skip("SQLite unavailable in this environment")
-        self.engine = create_async_engine(self.database_url)
+        database_url = self.database_url
+        if database_url.startswith("sqlite"):
+            self.sqlite_directory = tempfile.TemporaryDirectory(prefix="tenantkit-sqlite-")
+            database_url = "sqlite+aiosqlite:///" + self.sqlite_directory.name + "/test.db"
+        self.engine = create_async_engine(database_url)
         storage = SqlAlchemyStorage(
             session_factory=async_sessionmaker(self.engine),
             table_prefix="test_" + uuid4().hex + "_",
@@ -67,6 +83,8 @@ class TestSqlAlchemyStorage(StorageContract):
                 await connection.run_sync(self.metadata.drop_all)
         finally:
             await self.engine.dispose()
+            if hasattr(self, "sqlite_directory"):
+                self.sqlite_directory.cleanup()
 
 
 @pytest.mark.skipif(
