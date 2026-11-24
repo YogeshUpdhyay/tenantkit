@@ -1,5 +1,7 @@
-import pytest
 from datetime import timedelta
+from uuid import uuid4
+
+import pytest
 from tenantkit.config.models import TenantKitConfig
 from tenantkit.domain.models import Admin, Tenant, TenantUser
 from tenantkit.domain.claims import TenantClaims
@@ -33,7 +35,7 @@ def test_tokens_carry_resolved_permissions_and_refresh_is_not_access():
     user = TenantUser(
         tenant_id=tenant.id, email="u@example.com", password_hash="hash", roles=["reader"]
     )
-    pair = service.issue_pair(typ="tenant", subject=user, tenant=tenant)
+    pair = service.issue_pair(typ="tenant", subject=user, tenant=tenant, session_id=uuid4())
     claims = service.verify(pair.access_token, expected={"tenant", "impersonation"})
     assert isinstance(claims, TenantClaims)
     assert claims.tenant_id == tenant.id
@@ -50,7 +52,7 @@ def test_tokens_carry_resolved_permissions_and_refresh_is_not_access():
 def test_bad_signature_and_unknown_key_are_refused():
     service = TokenService(config())
     admin = Admin(email="a@b.com", password_hash="hash", roles=["root"])
-    pair = service.issue_pair(typ="admin", subject=admin)
+    pair = service.issue_pair(typ="admin", subject=admin, session_id=uuid4())
     prefix, body, sig = pair.access_token.split(".")
     with pytest.raises(InvalidTokenError):
         service.verify(prefix + "." + body + "." + ("a" if sig[0] != "a" else "b") + sig[1:])
@@ -76,7 +78,11 @@ def test_defaults_and_secret_errors():
 def test_issue_requires_tenant_for_tenant_tokens():
     service = TokenService(config())
     with pytest.raises(InvalidTokenError):
-        service.issue_pair(typ="tenant", subject=Admin(email="a@b.com", password_hash="hash"))
+        service.issue_pair(
+            typ="tenant",
+            subject=Admin(email="a@b.com", password_hash="hash"),
+            session_id=uuid4(),
+        )
 
 
 def test_config_rejects_structural_errors_with_public_error():
@@ -114,5 +120,5 @@ def test_invalid_schema_fails_before_startup(fields):
 
 def test_issue_returns_decoded_claims():
     admin = Admin(email="root@example.com", password_hash="hash", roles=["root"])
-    pair = TokenService(config()).issue_pair(typ="admin", subject=admin)
+    pair = TokenService(config()).issue_pair(typ="admin", subject=admin, session_id=uuid4())
     assert pair.claims.sub == str(admin.id)

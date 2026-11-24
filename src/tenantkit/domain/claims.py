@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal
 from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
@@ -16,6 +17,7 @@ class BaseClaims(BaseModel):
     nbf: int
     exp: int
     jti: UUID
+    sid: UUID
     roles: tuple[str, ...] = ()
     perms: tuple[str, ...] = ()
     email: str = ""
@@ -41,7 +43,6 @@ class ImpersonationClaims(BaseClaims):
 
 class RefreshClaims(BaseClaims):
     impersonation_role: str | None = None
-    admin_refresh_exp: int | None = None
     reason: str | None = None
     tenant_id: UUID | None = Field(default=None, alias="tid")
 
@@ -53,3 +54,5 @@ class TokenPair(BaseModel):
     refresh_token: str = Field(repr=False)
     token_type: str = "bearer"
     expires_in: int
+    refresh_jti: UUID
+    refresh_expires_at: datetime

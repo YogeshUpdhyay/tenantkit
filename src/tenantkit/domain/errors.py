@@ -85,6 +85,10 @@ class WrongTokenTypeError(InvalidTokenError):
     pass
 
 
+class RevokedTokenError(InvalidTokenError):
+    """The session behind a token was revoked or has expired."""
+
+
 class ImpersonationDisabledError(TenantKitError):
     pass
 

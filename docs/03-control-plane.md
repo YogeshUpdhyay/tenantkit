@@ -46,7 +46,10 @@ tenant = await kit.control_plane.create_tenant(
 | Create admin | `create_admin(actor, email, password, roles, impersonation_scope)` | `admins:manage` |
 | Update, deactivate admin | `update_admin` / `deactivate_admin` | `admins:manage` |
 | Unlock account | `unlock_account(actor, subject_type, subject_id)` | `tenant_users:manage` or `admins:manage` |
+| Revoke sessions | `revoke_sessions(actor, subject_type, subject_id)` (`"admin"` or `"tenant"`) | `sessions:revoke` |
+| List sessions | `list_sessions(actor, subject_type, subject_id, active_only=True, limit, offset)` | `sessions:read` |
 
+Every mutation runs in one transaction with its audit event (sub-doc 11), and deactivating a tenant, tenant user or admin revokes the affected sessions (sub-doc 10). Setting a tenant user's password through `update_tenant_user` also revokes that user's sessions. Permission-denied attempts are not audited.
 ## Tenant lifecycle
 
 1. **Create:** the slug is validated (lowercase letters, digits, hyphens, 3 to 63 characters) and must be unique. Attributes are validated against the schema. If no login policy is given, the default from config applies.

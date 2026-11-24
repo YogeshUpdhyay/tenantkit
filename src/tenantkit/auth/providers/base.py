@@ -16,6 +16,7 @@ class AuthResult:
     subject_id: UUID | None = None
     reason: str | None = None
     challenge: Any = None
+    newly_locked: bool = False
 
 
 class AuthProvider(Protocol):

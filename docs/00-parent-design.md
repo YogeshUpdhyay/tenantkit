@@ -21,6 +21,8 @@ The first consumer is our FastAPI application, but the package must stay framewo
 7. Expose a simple verification utility that returns validated claims, so the host builds its own authentication and authorisation layers.
 8. Make everything configurable at initialisation: keys, token lifetimes, login policies, roles, and storage.
 9. Stay pluggable: login providers and storage backends can be added without changing core code.
+10. Keep sessions revocable: refresh tokens are stateful, rotate on use, and can be revoked (sub-doc 10).
+11. Keep an audit trail of every security-relevant action in the package's own storage (sub-doc 11).
 
 ## 3. Non-goals for v1
 
@@ -46,7 +48,7 @@ The first consumer is our FastAPI application, but the package must stay framewo
 ### 4.3 Tokens
 
 - There are three token types: admin, tenant, and impersonation.
-- Each type has its own signing key, lifetime, and claims. Keys are never shared across token types. v1 includes refresh tokens for each type, with their own configurable lifetimes.
+- Each type has its own signing key, lifetime, and claims. Keys are never shared across token types. v1 includes refresh tokens for each type, with their own configurable lifetimes. From 0.2 every token carries a session id (`sid`); refresh tokens rotate, reuse is detected, and sessions can be revoked (sub-doc 10). `verify()` stays stateless; `verify_active()` additionally checks the session.
 - An impersonation token records both the acting admin and the target tenant.
 - A verification utility checks signature, expiry, issuer, audience, and token type, then returns typed claims or raises a typed error.
 
@@ -62,6 +64,8 @@ The first consumer is our FastAPI application, but the package must stay framewo
 
 - The core depends only on abstract repository interfaces.
 - An optional SQLAlchemy adapter (`pip install tenantkit[sqlalchemy]`) uses the host's engine and session.
+- An optional MongoDB adapter built on Beanie 2.x (`pip install tenantkit[mongo]`) needs a replica set or mongos (sub-doc 12).
+- Besides tenants, admins, tenant users and login attempts, storage holds sessions and audit events (`mt_sessions`, `mt_audit_events`).
 - Tables use a configurable prefix (default `mt_`).
 - The adapter's metadata is exposed so the host's Alembic migrations can include it.
 - Dynamic tenant fields are stored in a JSON column. Tenant user emails are globally unique, so each user belongs to one tenant. v1 has no schema name option and no sync adapter.
@@ -93,7 +97,7 @@ Dependencies point inward, from the outer layers to the core:
 - **Services:** ControlPlaneService, AdminAuthService, TenantAuthService, TokenService, and AccessService (roles, permissions, and impersonation checks).
 - **Interfaces:** repositories and auth providers.
 - **Domain:** plain models and the exception hierarchy, with no I/O.
-- **Adapters (outer layer):** SQLAlchemy storage and in-memory storage for tests.
+- **Adapters (outer layer):** SQLAlchemy storage, MongoDB (Beanie) storage and in-memory storage for tests.
 
 The typical request flow is:
 
@@ -119,6 +123,9 @@ tenantkit/
 │   ├── 06-tenant-auth.md
 │   ├── 07-tokens.md
 │   ├── 08-roles-permissions-impersonation.md
+│   ├── 10-sessions-revocation.md
+│   ├── 11-audit.md
+│   ├── 12-mongo-storage.md
 │   └── integrations/
 │       └── fastapi.md
 ├── src/tenantkit/
@@ -134,7 +141,8 @@ tenantkit/
 │   ├── storage/
 │   │   ├── interfaces.py      # repository protocols
 │   │   ├── memory/            # in-memory adapter (tests, prototyping)
-│   │   └── sqlalchemy/        # optional adapter: tables, repos, metadata
+│   │   ├── sqlalchemy/        # optional adapter: tables, repos, metadata
+│   │   └── beanie/            # optional MongoDB adapter (Beanie 2.x)
 │   ├── control_plane/
 │   │   ├── service.py         # tenant management
 │   │   └── schema.py          # dynamic tenant field schema and validation
@@ -145,6 +153,10 @@ tenantkit/
 │   │   ├── hashing.py
 │   │   ├── admin.py           # AdminAuthService
 │   │   └── tenant.py          # TenantAuthService
+│   ├── sessions/
+│   │   └── service.py         # session create, rotate, revoke
+│   ├── audit/
+│   │   └── service.py         # audit recorder, hooks, list and purge
 │   ├── tokens/
 │   │   ├── service.py         # issue and verify
 │   │   ├── keys.py            # key loading and checks from config values
@@ -174,6 +186,9 @@ tenantkit/
 | 07 | [Token service](07-tokens.md) | Three token types, claim structure, signing and keys, expiry and refresh, verification utility |
 | 08 | [Roles, permissions, and impersonation](08-roles-permissions-impersonation.md) | Identity categories, configurable roles, wildcards, claims mapping, scoped impersonation, audit fields |
 | 09 | [FastAPI integration guide](integrations/fastapi.md) | Example authentication middleware, authorisation dependencies, and mapping errors to 401 or 403 |
+| 10 | [Sessions and revocation](10-sessions-revocation.md) | Session records, refresh rotation and reuse detection, logout, revocation, `verify_active` |
+| 11 | [Audit log](11-audit.md) | Audit events and catalogue, post-commit hooks, read and purge API |
+| 12 | [MongoDB storage (Beanie)](12-mongo-storage.md) | Beanie 2.x adapter, host integration, collections, transactions |
 
 Each sub-doc follows the same template: purpose, responsibilities, public interface, data and claims, configuration, error cases, test cases, and decisions.
 
@@ -205,13 +220,15 @@ It must also contain the full FastAPI integration from sub-doc 09: setup, authen
 ## 11. Roadmap
 
 - **v1:** everything above.
-- **v1.x:** token revocation (deferred from v1), plus audit log hooks.
-- **v2:** tenant admins can manage users within their own organisation, plus ending sessions on password change, an async verify, key rotation, tenant lifecycle hooks, and a sync SQLAlchemy adapter.
+- **v1.x (delivered in 0.2.0):** session revocation, a built-in audit log with post-commit hooks, and a MongoDB (Beanie) storage adapter.
+- **v2:** tenant admins can manage users within their own organisation, plus an async verify, key rotation, tenant lifecycle hooks, and a sync SQLAlchemy adapter.
 - **v2.x:** SSO, ADFS, and LDAP providers, plus MFA as a second step in a login policy.
 
 ## 12. Decisions
 
 1. Refresh tokens: included in v1.
-2. Token revocation: deferred beyond v1.
+2. Token revocation: refresh/session revocation in v1.1; access tokens via opt-in `verify_active`.
 3. Signing keys: each token type has its own key.
 4. Package name: tenantkit.
+5. Audit: stored by tenantkit in the same transaction as the action; hooks observe after commit.
+6. MongoDB: Beanie 2.x on the PyMongo async client, replica set required by default.

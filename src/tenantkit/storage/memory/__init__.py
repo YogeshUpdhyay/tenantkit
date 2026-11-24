@@ -6,15 +6,27 @@ import asyncio
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
+from collections.abc import Sequence
 from datetime import datetime
 from typing import AsyncIterator, Generic, TypeVar
 from uuid import UUID
 
 from tenantkit.domain.errors import AlreadyExistsError, NotFoundError, StorageError
-from tenantkit.domain.models import Admin, LoginAttempt, Tenant, TenantUser
+from tenantkit.domain.models import (
+    Admin,
+    AuditEvent,
+    LoginAttempt,
+    RevokeReason,
+    Session,
+    SessionKind,
+    Tenant,
+    TenantUser,
+)
 from tenantkit.storage.interfaces import (
     AdminRepository,
+    AuditEventRepository,
     LoginAttemptRepository,
+    SessionRepository,
     TenantRepository,
     TenantUserRepository,
 )
@@ -119,6 +131,163 @@ class _LoginAttempts:
             self.rows.pop((subject_type, subject_id), None)
 
 
+class _Sessions:
+    def __init__(self, storage: InMemoryStorage) -> None:
+        self.storage = storage
+        self.rows: dict[UUID, Session] = {}
+
+    async def create(self, session: Session, /) -> Session:
+        async with self.storage.transaction():
+            if session.id in self.rows:
+                raise AlreadyExistsError("ID already exists")
+            self.rows[session.id] = deepcopy(session)
+            return deepcopy(session)
+
+    async def get(self, session_id: UUID, /) -> Session | None:
+        return deepcopy(self.rows.get(session_id))
+
+    async def rotate(
+        self,
+        session_id: UUID,
+        *,
+        expected_jti: UUID,
+        new_jti: UUID,
+        expires_at: datetime,
+        used_at: datetime,
+    ) -> Session | None:
+        async with self.storage.transaction():
+            row = self.rows.get(session_id)
+            if row is None or row.revoked_at is not None or row.current_jti != expected_jti:
+                return None
+            row.current_jti = new_jti
+            row.expires_at = expires_at
+            row.last_used_at = used_at
+            return deepcopy(row)
+
+    async def revoke(
+        self,
+        *,
+        reason: str,
+        at: datetime,
+        session_id: UUID | None = None,
+        kind: SessionKind | None = None,
+        subject_id: UUID | None = None,
+        tenant_id: UUID | None = None,
+        cascade_children: bool = False,
+    ) -> int:
+        if session_id is None and kind is None and subject_id is None and tenant_id is None:
+            raise ValueError("At least one revoke filter is required")
+        async with self.storage.transaction():
+            matched = [
+                row
+                for row in self.rows.values()
+                if (session_id is None or row.id == session_id)
+                and (kind is None or row.kind == kind)
+                and (subject_id is None or row.subject_id == subject_id)
+                and (tenant_id is None or row.tenant_id == tenant_id)
+            ]
+            count = 0
+            for row in matched:
+                if row.revoked_at is None:
+                    row.revoked_at, row.revoked_reason = at, reason
+                    count += 1
+            if cascade_children:
+                parents = {row.id for row in matched}
+                for row in self.rows.values():
+                    if row.parent_id in parents and row.revoked_at is None:
+                        row.revoked_at, row.revoked_reason = at, RevokeReason.PARENT_REVOKED
+                        count += 1
+            return count
+
+    async def list(
+        self,
+        *,
+        kind: SessionKind,
+        subject_id: UUID,
+        active_only: bool = True,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Session]:
+        if limit < 0 or offset < 0:
+            raise ValueError("Pagination values cannot be negative")
+        rows = [
+            row
+            for row in self.rows.values()
+            if row.kind == kind
+            and row.subject_id == subject_id
+            and (not active_only or row.is_active)
+        ]
+        rows.sort(key=lambda row: (row.created_at, row.id), reverse=True)
+        return deepcopy(rows[offset : offset + limit])
+
+    async def purge_expired(self, *, before: datetime) -> int:
+        async with self.storage.transaction():
+            doomed = [
+                key
+                for key, row in self.rows.items()
+                if row.expires_at < before
+                or (row.revoked_at is not None and row.revoked_at < before)
+            ]
+            for key in doomed:
+                del self.rows[key]
+            return len(doomed)
+
+
+class _AuditEvents:
+    def __init__(self, storage: InMemoryStorage) -> None:
+        self.storage = storage
+        self.rows: list[AuditEvent] = []
+
+    async def append(self, event: AuditEvent, /) -> None:
+        async with self.storage.transaction():
+            self.rows.append(deepcopy(event))
+
+    async def list(
+        self,
+        *,
+        tenant_ids: Sequence[UUID] | None = None,
+        actor_id: UUID | None = None,
+        target_id: UUID | None = None,
+        action: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[AuditEvent]:
+        if limit < 0 or offset < 0:
+            raise ValueError("Pagination values cannot be negative")
+        if tenant_ids is not None and not tenant_ids:
+            return []
+        prefix = action[:-1] if action is not None and action.endswith(".*") else None
+
+        def matches(event: AuditEvent) -> bool:
+            if tenant_ids is not None and event.tenant_id not in tenant_ids:
+                return False
+            if actor_id is not None and event.actor_id != actor_id:
+                return False
+            if target_id is not None and event.target_id != target_id:
+                return False
+            if action is not None and not (
+                event.action.startswith(prefix) if prefix is not None else event.action == action
+            ):
+                return False
+            if since is not None and event.occurred_at < since:
+                return False
+            return until is None or event.occurred_at <= until
+
+        rows = sorted(
+            (e for e in self.rows if matches(e)), key=lambda e: (e.occurred_at, e.id), reverse=True
+        )
+        return deepcopy(rows[offset : offset + limit])
+
+    async def purge(self, *, before: datetime) -> int:
+        async with self.storage.transaction():
+            kept = [e for e in self.rows if e.occurred_at >= before]
+            removed = len(self.rows) - len(kept)
+            self.rows = kept
+            return removed
+
+
 class InMemoryStorage:
     def __init__(self) -> None:
         self._tenants = _Repository[Tenant](self, "slug")
@@ -129,6 +298,10 @@ class InMemoryStorage:
         self.admins: AdminRepository = self._admins
         self.tenant_users: TenantUserRepository = self._users
         self.login_attempts: LoginAttemptRepository = self._attempts
+        self._sessions = _Sessions(self)
+        self._audit = _AuditEvents(self)
+        self.sessions: SessionRepository = self._sessions
+        self.audit_events: AuditEventRepository = self._audit
         self._lock = asyncio.Lock()
         self._owner: ContextVar[asyncio.Task[object] | None] = ContextVar(
             "tenantkit_memory_transaction", default=None
@@ -136,6 +309,10 @@ class InMemoryStorage:
 
     async def health_check(self) -> None:
         return None
+
+    def in_transaction(self) -> bool:
+        task = asyncio.current_task()
+        return task is not None and self._owner.get() is task
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:
@@ -150,13 +327,20 @@ class InMemoryStorage:
                 deepcopy(self._admins.rows),
                 deepcopy(self._users.rows),
                 deepcopy(self._attempts.rows),
+                deepcopy(self._sessions.rows),
+                list(self._audit.rows),
             )
             try:
                 yield
             except BaseException:
-                self._tenants.rows, self._admins.rows, self._users.rows, self._attempts.rows = (
-                    snapshots
-                )
+                (
+                    self._tenants.rows,
+                    self._admins.rows,
+                    self._users.rows,
+                    self._attempts.rows,
+                    self._sessions.rows,
+                    self._audit.rows,
+                ) = snapshots
                 raise
             finally:
                 self._owner.reset(token)

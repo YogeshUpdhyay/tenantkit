@@ -1,14 +1,17 @@
 """JWT issue and verification with independently pinned keys per identity type."""
 
+from __future__ import annotations
+
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 import logging
-from uuid import uuid4
+from uuid import UUID, uuid4
 import jwt
 from pydantic import ValidationError
 from tenantkit.config.models import TenantKitConfig, TokenTypeConfig
 from tenantkit.domain.claims import (
     AdminClaims,
+    BaseClaims,
     ImpersonationClaims,
     RefreshClaims,
     TenantClaims,
@@ -19,19 +22,33 @@ from tenantkit.domain.errors import (
     ExpiredTokenError,
     InvalidTokenError,
     KeyLoadError,
+    RevokedTokenError,
     WrongTokenTypeError,
 )
 from tenantkit.domain.models import Admin, Tenant, TenantUser
 
+if TYPE_CHECKING:
+    from tenantkit.storage.interfaces import Storage
+
+AnyClaims = AdminClaims | TenantClaims | ImpersonationClaims
+_CLAIM_MODELS: dict[str, type[BaseClaims]] = {
+    "admin": AdminClaims,
+    "tenant": TenantClaims,
+    "impersonation": ImpersonationClaims,
+}
+
 
 class TokenService:
-    def __init__(self, config: TenantKitConfig) -> None:
+    def __init__(self, config: TenantKitConfig, storage: Storage | None = None) -> None:
         self.config = config
+        self.storage = storage
         self._keys: dict[str, tuple[TokenType, TokenTypeConfig]] = {}
         for typ in ("admin", "tenant", "impersonation"):
             cfg: TokenTypeConfig = getattr(config.tokens, typ)
             if cfg.algorithm != "HS256":
                 from cryptography.hazmat.primitives.serialization import (
+                    Encoding,
+                    PublicFormat,
                     load_pem_private_key,
                     load_pem_public_key,
                 )
@@ -51,20 +68,22 @@ class TokenService:
                         or private.curve.name != "secp256r1"
                     ):
                         raise ValueError()
-                    if private.public_key().public_numbers() != public.public_numbers():
-                        raise ValueError()  # type: ignore[union-attr]
+                    spki = (Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+                    if private.public_key().public_bytes(*spki) != public.public_bytes(*spki):
+                        raise ValueError()
                 except (ValueError, TypeError, AttributeError):
                     raise KeyLoadError(f"tokens.{typ}: invalid or mismatched key") from None
-            self._keys[cfg.kid] = (typ, cfg)  # type: ignore[assignment]
+            self._keys[cfg.kid] = (typ, cfg)
 
     def issue_pair(
         self,
         *,
         typ: TokenType,
         subject: Admin | TenantUser,
+        session_id: UUID,
         tenant: Tenant | None = None,
         roles: list[str] | tuple[str, ...] | None = None,
-        admin_refresh_exp: int | None = None,
+        refresh_cap: datetime | None = None,
         reason: str | None = None,
     ) -> TokenPair:
         if typ == "tenant" and (
@@ -91,6 +110,7 @@ class TokenService:
             aud=self.config.audience,
             sub=str(subject.id),
             typ=typ,
+            sid=str(session_id),
             iat=current,
             nbf=current,
         )
@@ -99,10 +119,11 @@ class TokenService:
         refresh_exp = current + int(cfg.refresh_ttl.total_seconds())
         access_exp = current + int(cfg.access_ttl.total_seconds())
         if typ == "impersonation":
-            if admin_refresh_exp is None:
+            if refresh_cap is None:
                 raise InvalidTokenError("Admin session expiry required")
-            refresh_exp = min(refresh_exp, admin_refresh_exp)
-            access_exp = min(access_exp, admin_refresh_exp)
+            cap = int(refresh_cap.timestamp())
+            refresh_exp = min(refresh_exp, cap)
+            access_exp = min(access_exp, cap)
         if refresh_exp <= current:
             raise ExpiredTokenError("Session expired")
         access = dict(
@@ -120,25 +141,22 @@ class TokenService:
             access["act"] = {"sub": str(subject.id), "email": subject.email}
             if reason is not None:
                 access["reason"] = reason
-        refresh = dict(common, use="refresh", exp=refresh_exp, jti=str(uuid4()))
-        # Stateless impersonation refresh must retain the chosen privilege and cap.
+        refresh_jti = uuid4()
+        refresh = dict(common, use="refresh", exp=refresh_exp, jti=str(refresh_jti))
+        # Impersonation refresh retains the chosen role; the cap comes from the parent session.
         if typ == "impersonation":
             refresh["impersonation_role"] = assigned[0] if assigned else ""
-            refresh["admin_refresh_exp"] = admin_refresh_exp
             if reason is not None:
                 refresh["reason"] = reason
         key = cfg.private_key.get_secret_value()
         headers = {"kid": cfg.kid}
-        model = {
-            "admin": AdminClaims,
-            "tenant": TenantClaims,
-            "impersonation": ImpersonationClaims,
-        }[typ]
         return TokenPair(
-            claims=model.model_validate(access),
+            claims=cast(AnyClaims, _CLAIM_MODELS[typ].model_validate(access)),
             access_token=jwt.encode(access, key, algorithm=cfg.algorithm, headers=headers),
             refresh_token=jwt.encode(refresh, key, algorithm=cfg.algorithm, headers=headers),
             expires_in=access_exp - current,
+            refresh_jti=refresh_jti,
+            refresh_expires_at=datetime.fromtimestamp(refresh_exp, timezone.utc),
         )
 
     def _decode(self, token: str, use: str, expected: str | set[str] | None) -> dict[str, Any]:
@@ -171,20 +189,13 @@ class TokenService:
         except (jwt.PyJWTError, KeyError, TypeError, ValueError):
             raise InvalidTokenError("Invalid token") from None
 
-    def verify(
-        self, token: str, expected: str | set[str] | None = None
-    ) -> AdminClaims | TenantClaims | ImpersonationClaims:
+    def verify(self, token: str, expected: str | set[str] | None = None) -> AnyClaims:
         payload = self._decode(token, "access", expected)
         try:
             for key in ("email", "roles", "perms"):
                 if key not in payload:
                     raise InvalidTokenError("Missing claims")
-            model = {
-                "admin": AdminClaims,
-                "tenant": TenantClaims,
-                "impersonation": ImpersonationClaims,
-            }[payload["typ"]]
-            return model.model_validate(payload)
+            return cast(AnyClaims, _CLAIM_MODELS[payload["typ"]].model_validate(payload))
         except (ValidationError, KeyError):
             raise InvalidTokenError("Malformed claims") from None
 
@@ -193,3 +204,21 @@ class TokenService:
             return RefreshClaims.model_validate(self._decode(token, "refresh", expected))
         except ValidationError:
             raise InvalidTokenError("Malformed refresh claims") from None
+
+    async def verify_active(self, token: str, expected: str | set[str] | None = None) -> AnyClaims:
+        """Like ``verify`` but also requires the token's session (and parent) to be live."""
+        if self.storage is None:
+            raise RuntimeError("verify_active requires a TokenService created with storage")
+        claims = self.verify(token, expected)
+        session = await self.storage.sessions.get(claims.sid)
+        if session is None:
+            raise InvalidTokenError("Unknown session")
+        if not session.is_active:
+            raise RevokedTokenError("Session revoked or expired")
+        if claims.typ == "impersonation":
+            parent = (
+                await self.storage.sessions.get(session.parent_id) if session.parent_id else None
+            )
+            if parent is None or not parent.is_active:
+                raise RevokedTokenError("Session revoked or expired")
+        return claims

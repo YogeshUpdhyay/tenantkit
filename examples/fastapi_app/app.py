@@ -39,6 +39,10 @@ class Impersonate(BaseModel):
     reason: str | None = None
 
 
+class Logout(BaseModel):
+    refresh_token: SecretStr
+
+
 class NewTenant(BaseModel):
     slug: str
     attributes: dict[str, Any]
@@ -100,6 +104,7 @@ def create_app(kit: TenantKit) -> FastAPI:
             (errors.WrongTokenTypeError, 403, "forbidden"),
             (errors.InvalidCredentialsError, 401, "invalid_credentials"),
             (errors.AccountLockedError, 403, "account_locked"),
+            (errors.RevokedTokenError, 401, "token_revoked"),
             (errors.InvalidTokenError, 401, "invalid_token"),
             (errors.PermissionDeniedError, 403, "forbidden"),
             (errors.ImpersonationDisabledError, 403, "forbidden"),
@@ -125,6 +130,17 @@ def create_app(kit: TenantKit) -> FastAPI:
             kit.access.require_type(claims, *types)
             if permission:
                 kit.access.require_permission(claims, permission)
+            return claims
+
+        return dependency
+
+    def require_active(*types: str) -> Any:
+        """Like ``require`` but also checks the session, for instant revocation."""
+
+        async def dependency(request: Request) -> Any:
+            token = request.headers.get("authorization", "").partition(" ")[2]
+            claims = await kit.tokens.verify_active(token, expected=set(types))
+            request.state.claims = claims
             return claims
 
         return dependency
@@ -163,6 +179,24 @@ def create_app(kit: TenantKit) -> FastAPI:
             refresh_token=body.refresh_token.get_secret_value()
         )
 
+    @app.post("/auth/logout")
+    async def logout(
+        body: Logout, claims: Any = Depends(require("admin", "tenant", "impersonation"))
+    ) -> Any:
+        token = body.refresh_token.get_secret_value()
+        if claims.typ == "admin":
+            await kit.admin_auth.logout(refresh_token=token)
+        elif claims.typ == "tenant":
+            await kit.tenant_auth.logout(refresh_token=token)
+        else:
+            await kit.access.end_impersonation(refresh_token=token)
+        return {"status": "logged_out"}
+
+    @app.post("/auth/logout-all")
+    async def logout_all(claims: Any = Depends(require("admin", "tenant"))) -> Any:
+        service = kit.admin_auth if claims.typ == "admin" else kit.tenant_auth
+        return {"revoked": await service.logout_all(actor=claims)}
+
     @app.post("/auth/impersonate")
     async def impersonate(body: Impersonate, claims: Any = Depends(require("admin"))) -> Any:
         return await kit.access.impersonate(
@@ -178,6 +212,20 @@ def create_app(kit: TenantKit) -> FastAPI:
         return await kit.control_plane.create_tenant(
             actor=claims, slug=body.slug, attributes=body.attributes
         )
+
+    @app.get("/admin/audit")
+    async def audit_events(
+        action: str | None = None,
+        tenant_id: UUID | None = None,
+        limit: int = 50,
+        claims: Any = Depends(require("admin")),
+    ) -> Any:
+        return await kit.audit.list(claims, action=action, tenant_id=tenant_id, limit=limit)
+
+    @app.get("/tenant/billing")
+    async def billing(claims: Any = Depends(require_active("tenant"))) -> Any:
+        # A sensitive route: a revoked session is refused immediately, not at token expiry.
+        return {"tenant_id": str(claims.tenant_id), "plan": "pro"}
 
     @app.get("/tenant/profile")
     async def profile(claims: Any = Depends(require("tenant"))) -> Any:

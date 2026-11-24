@@ -92,3 +92,29 @@ class TestSqlAlchemyStorage(StorageContract):
 )
 class TestPostgresStorage(TestSqlAlchemyStorage):
     database_url = os.getenv("TENANTKIT_TEST_DATABASE_URL", "postgresql+asyncpg://")
+
+
+@pytest.mark.skipif(
+    not os.getenv("TENANTKIT_TEST_MONGO_URL"), reason="TENANTKIT_TEST_MONGO_URL not set"
+)
+class TestBeanieStorage(StorageContract):
+    async def make_storage(self):
+        from contextlib import AsyncExitStack
+
+        from support import open_mongo_storage
+
+        self._stack = AsyncExitStack()
+        return await self._stack.enter_async_context(open_mongo_storage())
+
+    async def close_storage(self, storage):
+        await self._stack.aclose()
+
+
+def test_sqlalchemy_metadata_includes_session_and_audit_tables_with_prefix():
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from tenantkit.storage.sqlalchemy import SqlAlchemyStorage, metadata
+
+    storage = SqlAlchemyStorage(session_factory=async_sessionmaker(), table_prefix="acme_")
+    assert {"acme_sessions", "acme_audit_events"} <= set(storage.metadata.tables)
+    assert {"mt_sessions", "mt_audit_events"} <= set(metadata.tables)
