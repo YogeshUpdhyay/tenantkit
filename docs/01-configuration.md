@@ -48,6 +48,7 @@ All configuration arrives as arguments at initialisation. The package never read
 | `impersonation` | enabled flag, default scope for new admins, allowed roles per admin role | Detailed in sub-doc 08 |
 | `hashing` | argon2 parameters | Safe defaults; override only with care |
 | `clock` | allowed clock skew in seconds | Default 30 |
+| `audit` | `include_failed_login_email` (default `false`) | Whether failed-login audit events carry the attempted email (sub-doc 11) |
 
 ### Default lifetimes
 
@@ -180,6 +181,9 @@ hashing:
 
 clock:
   skew_seconds: 30
+
+audit:
+  include_failed_login_email: false
 ```
 
 ## Validation rules (fail fast)

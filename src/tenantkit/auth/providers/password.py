@@ -37,7 +37,7 @@ class PasswordProvider:
         attempt = await self.storage.login_attempts.get(request.subject_type, subject.id)
         now = datetime.now(timezone.utc)
         if attempt and attempt.locked_until and attempt.locked_until > now:
-            return AuthResult("failure", reason="locked")
+            return AuthResult("failure", subject_id=subject.id, reason="locked")
         if attempt and attempt.locked_until and attempt.locked_until <= now:
             await self.storage.login_attempts.reset(request.subject_type, subject.id)
             attempt = None
@@ -50,7 +50,14 @@ class PasswordProvider:
                 max_attempts=settings.lockout.max_attempts,
                 locked_until=now + timedelta(minutes=settings.lockout.lock_minutes),
             )
-            return AuthResult("failure", reason="locked" if recorded.locked_until else None)
+            return AuthResult(
+                "failure",
+                subject_id=subject.id,
+                reason="locked" if recorded.locked_until else None,
+                # Exactly one concurrent failure observes the count that sets the lock.
+                newly_locked=recorded.locked_until is not None
+                and recorded.failed_count == settings.lockout.max_attempts,
+            )
         await self.storage.login_attempts.reset(request.subject_type, subject.id)
         if self.hashing.hasher.check_needs_rehash(subject.password_hash):
             subject.password_hash = self.hashing.hash(password)

@@ -6,7 +6,7 @@
 
 - Log admins in using the provider named in `admin_auth.policy`.
 - Issue admin access and refresh tokens through the token service.
-- Refresh admin sessions.
+- Refresh admin sessions (rotating the refresh token) and end them with logout (sub-doc 10).
 - Let admins change their own password.
 - Apply the admin password rules and lockout settings from config.
 
@@ -33,7 +33,7 @@ admin = await kit.admin_auth.me(actor=claims)   # current Admin record, without 
 2. Pick the provider from `admin_auth.policy` (v1: password).
 3. The provider checks the credentials, lockout, and that the admin is active.
 4. On success, load the admin's roles.
-5. Ask the token service for an admin access token and an admin refresh token.
+5. In one transaction: create the session, ask the token service for an admin access token and an admin refresh token carrying its `sid`, and audit `auth.login.succeeded`. Failures (and lockout counting) are audited outside that transaction as `auth.login.failed` / `auth.account.locked`.
 6. Return the `TokenPair`.
 
 Every failure raises `InvalidCredentialsError`, except a locked account, which raises `AccountLockedError` (sub-doc 04).
@@ -55,21 +55,22 @@ Impersonation scope is not put in the token. It is checked from storage when an 
 ## Refresh flow
 
 1. Verify the refresh token with the admin key, and check that it is an admin refresh token.
-2. Load the admin from storage. Refuse if they are missing or inactive.
-3. Re-read their roles, so role changes take effect at the next refresh.
-4. Issue a new access token and a new refresh token (rotation).
+2. Load the session from `sid`. Unknown: `InvalidTokenError`. Revoked or expired: `RevokedTokenError`.
+3. Load the admin from storage. If they are missing or inactive, revoke the session and refuse.
+4. Re-read their roles, so role changes take effect at the next refresh.
+5. Issue a new access token and a new refresh token with the same `sid`, and rotate the session's `current_jti`.
 
-Because refresh tokens are stateless in v1, an old refresh token stays usable until it expires even after rotation. Stored refresh tokens, with reuse detection, arrive with revocation in a later version.
+An old refresh token is no longer accepted after rotation. Presenting it again is treated as theft: the session and its impersonation sessions are revoked, `token.reuse_detected` is audited, and `RevokedTokenError` is raised. Clients must serialise refresh calls. See [10-sessions-revocation.md](10-sessions-revocation.md).
 
 ## Logout
 
-There is no server-side logout in v1, since tokens are stateless. The host deletes tokens on the client side. Short access lifetimes limit the risk. Deactivating an admin stops their next refresh.
+`await kit.admin_auth.logout(refresh_token=...)` revokes the session and any impersonation sessions started from it; it is idempotent and a no-op for an expired token. `await kit.admin_auth.logout_all(actor=claims)` revokes all of the admin's sessions (impersonation actors are refused). Deactivating an admin revokes their sessions. An access token already issued stays valid until it expires unless the host uses `verify_active`.
 
 ## Password change
 
 - Needs a valid admin access token and the current password.
 - The new password must pass the admin password rules.
-- Existing tokens stay valid until they expire.
+- All of the admin's sessions are revoked (reason `password_changed`), including the current one: the admin logs in again. Already-issued access tokens work until they expire, or until `verify_active` is used.
 
 ## Error cases
 
@@ -77,7 +78,8 @@ There is no server-side logout in v1, since tokens are stateless. The host delet
 | --- | --- |
 | `InvalidCredentialsError` | Wrong email or password, unknown or inactive admin |
 | `AccountLockedError` | Too many failed attempts |
-| `InvalidTokenError` | Refresh token is invalid, expired, or not an admin refresh token |
+| `InvalidTokenError` | Refresh token is invalid, expired, not an admin refresh token, or has no matching session |
+| `RevokedTokenError` | The session is revoked or expired, or the refresh token was reused |
 | `PasswordPolicyError` | New password breaks the rules |
 
 ## Test cases
@@ -87,7 +89,8 @@ There is no server-side logout in v1, since tokens are stateless. The host delet
 - Inactive admins cannot log in or refresh.
 - Tenant and impersonation refresh tokens are refused by admin refresh.
 - Role changes appear in the claims after the next refresh.
-- Refresh returns a new refresh token each time.
+- Refresh returns a new refresh token each time; the previous one is rejected, and reuse revokes the session.
+- Logout, logout-all and password change revoke sessions.
 - Password change enforces the current password and the rules.
 - Lockout and unlock behave as in sub-doc 04.
 

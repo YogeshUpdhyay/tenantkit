@@ -10,7 +10,7 @@ tenantkit ships no FastAPI code. This guide shows how a host app builds its own 
 | Authentication middleware | Host, using `kit.tokens.verify()` | Verifies the bearer token and stores claims on the request |
 | Authorisation dependencies | Host, using `kit.access` helpers | Checks token type and permissions per endpoint |
 | Error handlers | Host | Maps tenantkit errors to 401 and 403 responses |
-| Auth endpoints | Host, calling auth services | Login, refresh, impersonation |
+| Auth endpoints | Host, calling auth services | Login, refresh, logout, logout-all, impersonation |
 
 ## 1. Setup
 
@@ -141,7 +141,8 @@ Errors raised in routes and dependencies reach exception handlers. tenantkit err
 | --- | --- | --- |
 | `InvalidCredentialsError` | 401 | `invalid_credentials` |
 | `AccountLockedError` | 403 | `account_locked` ("Account locked. Contact your administrator.") |
-| `InvalidTokenError` (and subclasses, in routes) | 401 | `invalid_token` |
+| `RevokedTokenError` | 401 | `token_revoked` |
+| `InvalidTokenError` (and other subclasses, in routes) | 401 | `invalid_token` |
 | `WrongTokenTypeError` | 403 | `forbidden` |
 | `PermissionDeniedError` | 403 | `forbidden` |
 | `TenantValidationError`, `PasswordPolicyError`, `InvalidSlugError` | 422 | field-level details |
@@ -157,6 +158,7 @@ STATUS = [
     (tk.InvalidCredentialsError, 401, "invalid_credentials"),
     (tk.AccountLockedError, 403, "account_locked"),
     (tk.WrongTokenTypeError, 403, "forbidden"),
+    (tk.RevokedTokenError, 401, "token_revoked"),
     (tk.InvalidTokenError, 401, "invalid_token"),
     (tk.PermissionDeniedError, 403, "forbidden"),
     (tk.ImpersonationDisabledError, 403, "forbidden"),
@@ -223,6 +225,36 @@ async def impersonate(body: ImpersonateBody, claims=Depends(AdminOnly), kit: Ten
 async def impersonation_refresh(body: Refresh, kit: TenantKit = Depends(get_kit)):
     return await kit.access.refresh_impersonation(refresh_token=body.refresh_token)
 ```
+
+Logout, logout-all, an audit read route and a route that checks the session:
+
+```python
+@auth.post("/logout")
+async def logout(body: Refresh, claims=Depends(require("admin", "tenant", "impersonation")), kit: TenantKit = Depends(get_kit)):
+    if claims.typ == "admin":
+        await kit.admin_auth.logout(refresh_token=body.refresh_token)
+    elif claims.typ == "tenant":
+        await kit.tenant_auth.logout(refresh_token=body.refresh_token)
+    else:
+        await kit.access.end_impersonation(refresh_token=body.refresh_token)
+
+@auth.post("/logout-all")
+async def logout_all(claims=Depends(require("admin", "tenant")), kit: TenantKit = Depends(get_kit)):
+    service = kit.admin_auth if claims.typ == "admin" else kit.tenant_auth
+    return {"revoked": await service.logout_all(actor=claims)}
+
+@app.get("/admin/audit")
+async def audit(action: str | None = None, claims=Depends(AdminOnly), kit: TenantKit = Depends(get_kit)):
+    return await kit.audit.list(claims, action=action)        # needs audit:read
+
+@app.get("/tenant/billing")                                    # sensitive: instant revocation
+async def billing(request: Request, kit: TenantKit = Depends(get_kit)):
+    token = request.headers["authorization"].partition(" ")[2]
+    claims = await kit.tokens.verify_active(token, expected="tenant")
+    ...
+```
+
+**Serialise refresh calls client-side.** Refresh tokens rotate on every use and a reused token ends the session, so a single-page app that refreshes from several tabs at once must hold a lock (for example the Web Locks API) around the refresh call. `verify` in the middleware stays storage-free, so a logged-out user's access token works until it expires; routes that need instant cut-off call `verify_active`.
 
 The tenant slug usually comes from a subdomain (`acme.example.com`) or a login URL. The host fills `tenant_slug` from there, rather than trusting a value the user typed.
 

@@ -1,21 +1,34 @@
 from collections.abc import Iterable
-from uuid import UUID
+from uuid import UUID, uuid4
 from tenantkit.config.models import TenantKitConfig
 from tenantkit.storage.interfaces import Storage
-from tenantkit.domain.models import Admin, Tenant
+from tenantkit.audit.service import AuditService, actor_fields
+from tenantkit.domain.models import Admin, AuditEvent, RevokeReason, Tenant
+from tenantkit.domain.permissions import has_permission
+from tenantkit.sessions.service import SessionService
 from tenantkit.domain.claims import BaseClaims, TokenPair
 from tenantkit.domain.errors import (
+    ExpiredTokenError,
     ImpersonationDisabledError,
     NotFoundError,
     PermissionDeniedError,
+    RevokedTokenError,
     WrongTokenTypeError,
 )
 from tenantkit.tokens.service import TokenService
 
 
 class AccessService:
-    def __init__(self, config: TenantKitConfig, storage: Storage, tokens: TokenService) -> None:
+    def __init__(
+        self,
+        config: TenantKitConfig,
+        storage: Storage,
+        tokens: TokenService,
+        audit: AuditService,
+        sessions: SessionService,
+    ) -> None:
         self.config, self.storage, self.tokens = config, storage, tokens
+        self.audit, self.sessions = audit, sessions
 
     @staticmethod
     def is_type(claims: BaseClaims, *types: str) -> bool:
@@ -27,12 +40,7 @@ class AccessService:
 
     @staticmethod
     def has_permission(claims: BaseClaims, permission: str) -> bool:
-        if "*" in permission:
-            raise ValueError("Permission checks require concrete permissions")
-        return any(
-            p == "*" or p == permission or (p.endswith(":*") and permission.startswith(p[:-1]))
-            for p in claims.perms
-        )
+        return has_permission(claims, permission)
 
     @classmethod
     def has_all(cls, claims: BaseClaims, permissions: Iterable[str]) -> bool:
@@ -84,32 +92,121 @@ class AccessService:
         reason: str | None = None,
     ) -> TokenPair:
         self.require_type(actor, "admin")
-        self.require_permission(actor, "impersonate")
-        admin, tenant = await self._check_impersonation(UUID(actor.sub), tenant_id, role)
+        try:
+            self.require_permission(actor, "impersonate")
+            admin, tenant = await self._check_impersonation(UUID(actor.sub), tenant_id, role)
+        except PermissionDeniedError as exc:
+            await self.audit.emit_standalone(
+                AuditEvent(
+                    **{
+                        **actor_fields(actor),
+                        "action": "impersonation.denied",
+                        "outcome": "failure",
+                        "tenant_id": tenant_id,
+                        "target_type": "tenant",
+                        "target_id": tenant_id,
+                        "metadata": {"role": role, "cause": str(exc)},
+                    }
+                )
+            )
+            raise
         refresh = self.tokens.verify_refresh(admin_refresh_token, expected="admin")
-        if refresh.sub != actor.sub:
+        if refresh.sub != actor.sub or refresh.sid != actor.sid:
             raise PermissionDeniedError("Admin session mismatch")
-        return self.tokens.issue_pair(
+        parent = await self.sessions.load(refresh)
+        session_id = uuid4()
+        pair = self.tokens.issue_pair(
             typ="impersonation",
             subject=admin,
+            session_id=session_id,
             tenant=tenant,
             roles=[role],
-            admin_refresh_exp=refresh.exp,
+            refresh_cap=parent.expires_at,
             reason=reason,
         )
+        async with self.audit.recorder() as rec:
+            await self.sessions.create(
+                pair=pair,
+                kind="impersonation",
+                subject_id=admin.id,
+                tenant_id=tenant.id,
+                parent_id=parent.id,
+            )
+            await rec.emit(
+                AuditEvent(
+                    **{
+                        **actor_fields(actor),
+                        "action": "impersonation.started",
+                        "outcome": "success",
+                        "tenant_id": tenant.id,
+                        "target_type": "session",
+                        "target_id": session_id,
+                        "reason": reason,
+                        "metadata": {"role": role},
+                    }
+                )
+            )
+        return pair
 
     async def refresh_impersonation(self, refresh_token: str) -> TokenPair:
         claims = self.tokens.verify_refresh(refresh_token, expected="impersonation")
         if claims.tenant_id is None:
             raise PermissionDeniedError("Missing tenant")
+        session = await self.sessions.load(claims)
+        parent = await self.storage.sessions.get(session.parent_id) if session.parent_id else None
+        if parent is None or not parent.is_active:
+            await self.sessions.revoke_standalone(
+                session_id=session.id, reason=RevokeReason.PARENT_REVOKED
+            )
+            raise RevokedTokenError("Parent session revoked or expired")
+        admin = await self.storage.admins.get(UUID(claims.sub))
+        if admin is None or not admin.is_active:
+            await self.sessions.revoke_standalone(
+                session_id=session.id, reason=RevokeReason.SUBJECT_DEACTIVATED
+            )
+            raise PermissionDeniedError("Admin inactive")
+        target = await self.storage.tenants.get(claims.tenant_id)
+        if target is not None and not target.is_active:
+            await self.sessions.revoke_standalone(
+                session_id=session.id, reason=RevokeReason.TENANT_DEACTIVATED
+            )
         admin, tenant = await self._check_impersonation(
             UUID(claims.sub), claims.tenant_id, claims.impersonation_role or ""
         )
-        return self.tokens.issue_pair(
+        role = claims.impersonation_role or ""
+        pair = self.tokens.issue_pair(
             typ="impersonation",
             subject=admin,
+            session_id=session.id,
             tenant=tenant,
-            roles=[claims.impersonation_role or ""],
-            admin_refresh_exp=claims.exp,
+            roles=[role],
+            refresh_cap=parent.expires_at,
             reason=claims.reason,
         )
+        await self.sessions.rotate(
+            claims=claims, pair=pair, action="impersonation.refreshed", metadata={"role": role}
+        )
+        return pair
+
+    async def end_impersonation(self, *, refresh_token: str) -> None:
+        """Revoke an impersonation session early. Idempotent; expired tokens are a no-op."""
+        try:
+            claims = self.tokens.verify_refresh(refresh_token, expected="impersonation")
+        except ExpiredTokenError:
+            return
+        async with self.audit.recorder() as rec:
+            count = await self.sessions.revoke(
+                session_id=claims.sid, reason=RevokeReason.IMPERSONATION_ENDED
+            )
+            if count:
+                await rec.emit(
+                    AuditEvent(
+                        **{
+                            **actor_fields(claims),
+                            "action": "impersonation.ended",
+                            "outcome": "success",
+                            "target_type": "session",
+                            "target_id": claims.sid,
+                        }
+                    )
+                )

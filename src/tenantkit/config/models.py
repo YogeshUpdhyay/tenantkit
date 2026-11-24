@@ -147,6 +147,10 @@ class TenantSchema(FrozenModel):
     fields: tuple[TenantField, ...] = ()
 
 
+class AuditConfig(FrozenModel):
+    include_failed_login_email: bool = False
+
+
 class TenantKitConfig(FrozenModel):
     def __init__(self, **data: Any) -> None:
         try:
@@ -169,6 +173,7 @@ class TenantKitConfig(FrozenModel):
     impersonation: ImpersonationConfig = Field(default_factory=ImpersonationConfig)
     hashing: HashingConfig = Field(default_factory=HashingConfig)
     clock: ClockConfig = Field(default_factory=ClockConfig)
+    audit: AuditConfig = Field(default_factory=AuditConfig)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
@@ -217,8 +222,8 @@ class TenantKitConfig(FrozenModel):
                     for p in role.permissions
                 ):
                     errors.append("roles: invalid wildcard")
-        for role, allowed in self.impersonation.allowed_roles.items():
-            if role not in self.roles.admin or any(
+        for admin_role, allowed in self.impersonation.allowed_roles.items():
+            if admin_role not in self.roles.admin or any(
                 r not in self.roles.impersonation for r in allowed
             ):
                 errors.append("impersonation.allowed_roles: unknown role")

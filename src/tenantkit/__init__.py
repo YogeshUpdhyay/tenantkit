@@ -1,8 +1,10 @@
 """Public API for tenantkit."""
 
 from tenantkit import errors
+from tenantkit.audit.service import AuditHook
 from tenantkit.config.models import (
     Argon2Config,
+    AuditConfig,
     AuthConfig,
     ClockConfig,
     HashingConfig,
@@ -25,7 +27,16 @@ from tenantkit.domain.claims import (
     TenantClaims,
     TokenPair,
 )
-from tenantkit.domain.models import Admin, ImpersonationScope, LoginAttempt, Tenant, TenantUser
+from tenantkit.domain.models import (
+    Admin,
+    AuditEvent,
+    ImpersonationScope,
+    LoginAttempt,
+    RevokeReason,
+    Session,
+    Tenant,
+    TenantUser,
+)
 from tenantkit.kit import TenantKit
 
 __all__ = [
@@ -55,5 +66,10 @@ __all__ = [
     "TenantUser",
     "ImpersonationScope",
     "LoginAttempt",
+    "AuditConfig",
+    "AuditEvent",
+    "AuditHook",
+    "RevokeReason",
+    "Session",
     "errors",
 ]

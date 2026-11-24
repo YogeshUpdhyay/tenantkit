@@ -40,7 +40,7 @@ user = await kit.tenant_auth.me(actor=claims)
 3. Check that the requested method is enabled in that policy. If not, fail.
 4. Hand the credentials to that method's provider. For password, the email is trimmed and lowercased.
 5. The provider finds the user, checks they belong to this tenant and are active, then checks the credentials and lockout.
-6. On success, issue a tenant access token and refresh token.
+6. On success, in one transaction create the session, issue a tenant access token and refresh token carrying its `sid`, and audit `auth.login.succeeded`. Failures are audited outside that transaction.
 
 All failures raise `InvalidCredentialsError`, except a locked account, which raises `AccountLockedError`. An inactive tenant also returns `InvalidCredentialsError`, so the response does not reveal tenant status; the host can log the detailed reason.
 
@@ -63,17 +63,18 @@ The host should always scope its own data by `tid` from verified claims, never b
 ## Refresh flow
 
 1. Verify the refresh token with the tenant key and check it is a tenant refresh token.
-2. Reload the user and tenant. Refuse if either is missing or inactive.
+2. Load the session from `sid` (`RevokedTokenError` if revoked or expired). Reload the user and tenant; if either is missing or inactive, revoke the session and refuse.
 3. Re-read roles, so role changes apply at the next refresh.
-4. Issue a new access token and a new refresh token.
+4. Issue a new access token and a new refresh token with the same `sid`, and rotate the session. Reusing an old refresh token revokes the session.
 
-As with admins, refresh tokens are stateless in v1, so there is no server-side logout. Deactivating a user or tenant stops the next refresh.
+`await kit.tenant_auth.logout(refresh_token=...)` and `logout_all(actor=claims)` revoke sessions. Deactivating a user or the tenant revokes the affected sessions. Details in [10-sessions-revocation.md](10-sessions-revocation.md).
 
 ## Password change
 
 - Needs a valid tenant access token and the current password.
 - The new password must pass the config tenant rules, tightened by the tenant's policy if set.
 - Impersonation tokens cannot change a tenant user's password.
+- Changing the password revokes all of the user's sessions, including the current one.
 
 ## Error cases
 
@@ -82,6 +83,7 @@ As with admins, refresh tokens are stateless in v1, so there is no server-side l
 | `InvalidCredentialsError` | Wrong credentials, unknown or inactive user, inactive tenant, slug mismatch, or a method not enabled |
 | `AccountLockedError` | Too many failed attempts |
 | `InvalidTokenError` | Refresh token is invalid, expired, or not a tenant refresh token |
+| `RevokedTokenError` | The session is revoked or expired, or the refresh token was reused |
 | `PasswordPolicyError` | New password breaks the rules |
 | `PermissionDeniedError` | Password change attempted with an impersonation token |
 

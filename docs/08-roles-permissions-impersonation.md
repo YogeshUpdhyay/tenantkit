@@ -53,7 +53,7 @@ impersonation:
 ```
 
 - Permission names are free-form strings. The suggested style is `resource:action`.
-- The package only gives meaning to its own control plane permissions (sub-doc 03) and `impersonate`. Every other permission, such as `data:write`, is meaningful only to the host.
+- The package only gives meaning to its own control plane permissions (sub-doc 03), `impersonate`, and the session and audit permissions `sessions:read`, `sessions:revoke`, `audit:read` and `audit:purge` (sub-docs 10 and 11). The default `super_admin` role (`*`) covers them. Every other permission, such as `data:write`, is meaningful only to the host.
 - A subject can hold several roles. Their permissions are the union of those roles' permissions.
 - Wildcards are supported in v1: `data:*` grants every `data:` permission, and `*` grants all permissions. Wildcards are allowed only in role definitions, never in the permission a check asks for. They are kept as written in the token's `perms` and matched by the check helpers.
 
@@ -116,20 +116,22 @@ Checks, in order:
 3. The admin is still active in storage, and their stored scope covers this tenant.
 4. The tenant exists and is active.
 5. The requested role is an impersonation role allowed for one of the admin's roles under `allowed_roles`.
-6. The admin refresh token verifies and belongs to the same admin.
+6. The admin refresh token verifies, belongs to the same admin and the same session as the actor's access token, and its session is still active (otherwise `RevokedTokenError`).
 
-On success, the token service issues an impersonation pair: claims as in sub-doc 07, with `act` naming the admin and an optional `reason` claim. The refresh token's expiry is capped at the admin refresh token's expiry.
+A failed scope, role or permission check is audited as `impersonation.denied`.
+
+On success, the token service issues an impersonation pair: claims as in sub-doc 07, with `act` naming the admin and an optional `reason` claim. The new impersonation session records the admin session as its parent, and its expiry is capped at the parent session's `expires_at`.
 
 ### During and after
 
-- Impersonation refresh re-checks steps 1, 3, 4 and 5, so removing scope or deactivating the tenant ends the session at the next refresh.
-- Ending impersonation is client-side: the host discards the impersonation tokens and returns to the admin tokens.
+- Impersonation refresh re-checks steps 1, 3, 4 and 5, and requires the parent admin session to be active, so removing scope, deactivating the tenant or revoking the admin session ends impersonation at the next refresh (deactivation and revocation also revoke the session itself).
+- `kit.access.end_impersonation(refresh_token=...)` revokes an impersonation session early; the host also discards the impersonation tokens.
 - Impersonation tokens cannot change passwords or call control plane operations.
 - A tenant user's identity is never borrowed: `sub` is always the admin's ID.
 
 ### Audit
 
-Every impersonation token carries the admin ID in `act`, the target tenant in `tid`, its own `jti`, and the optional `reason`. The host logs these with each request. A built-in audit log store is deferred, as listed in the parent doc's roadmap.
+Every impersonation token carries the admin ID in `act`, the target tenant in `tid`, its own `jti` and `sid`, and the optional `reason`. The host still logs these with each request. In addition, tenantkit records `impersonation.started`, `.refreshed`, `.ended` and `.denied` events in its built-in audit log; see [11-audit.md](11-audit.md).
 
 ## Error cases
 
@@ -151,7 +153,8 @@ Every impersonation token carries the admin ID in `act`, the target tenant in `t
 - Scope `all`, `list`, and `none` allow and refuse correctly.
 - Impersonation is refused for inactive tenants, inactive admins, missing `impersonate` permission, disallowed roles, and when disabled.
 - Impersonation refresh fails after scope is removed or the tenant is deactivated.
-- The impersonation refresh expiry never passes the admin refresh expiry.
+- The impersonation session's expiry never passes its parent admin session's expiry.
+- Ending or revoking the admin session ends impersonation sessions started from it.
 - Impersonation tokens are refused by control plane and password change operations.
 - `act`, `tid` and `jti` are present in impersonation tokens; impersonation without a `reason` succeeds, and the claim is simply absent.
 

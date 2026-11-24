@@ -1,6 +1,9 @@
 """Explicitly configured service facade."""
 
-from typing import Sequence
+from collections.abc import Sequence
+
+from tenantkit.audit.service import AuditHook, AuditService
+from tenantkit.sessions.service import SessionService
 from tenantkit.config.models import TenantKitConfig
 from tenantkit.storage.interfaces import Storage
 from tenantkit.auth.hashing import Hashing
@@ -21,6 +24,7 @@ class TenantKit:
         config: TenantKitConfig,
         storage: Storage,
         providers: Sequence[AuthProvider] | None = None,
+        audit_hooks: Sequence[AuditHook] | None = None,
     ) -> None:
         self.config = config
         self.storage = storage
@@ -35,15 +39,25 @@ class TenantKit:
         for policy in (config.admin_auth.policy, config.tenant_auth.default_policy):
             if not policy.providers or any(name not in registered for name in policy.providers):
                 raise ConfigError("Unknown provider")
-        self.tokens = TokenService(config)
-        self.access = AccessService(config, storage, self.tokens)
-        self.control_plane = ControlPlaneService(config, storage, self.access, hashing, registered)
-        self.admin_auth = AdminAuthService(config, storage, self.tokens, hashing, registered)
-        self.tenant_auth = TenantAuthService(config, storage, self.tokens, hashing, registered)
+        self.audit = AuditService(config, storage, audit_hooks)
+        self.tokens = TokenService(config, storage)
+        self.sessions = SessionService(config, storage, self.audit, self.tokens)
+        self.access = AccessService(config, storage, self.tokens, self.audit, self.sessions)
+        self.control_plane = ControlPlaneService(
+            config, storage, self.access, hashing, registered, self.audit, self.sessions
+        )
+        self.admin_auth = AdminAuthService(
+            config, storage, self.tokens, hashing, registered, self.audit, self.sessions
+        )
+        self.tenant_auth = TenantAuthService(
+            config, storage, self.tokens, hashing, registered, self.audit, self.sessions
+        )
 
     async def health_check(self) -> None:
         try:
             await self.storage.health_check()
+        except ConfigError:
+            raise
         except Exception:
             raise StorageUnavailableError("Storage health check failed") from None
 
@@ -54,7 +68,8 @@ class TenantKit:
         config: TenantKitConfig,
         storage: Storage,
         providers: Sequence[AuthProvider] | None = None,
+        audit_hooks: Sequence[AuditHook] | None = None,
     ) -> "TenantKit":
-        kit = cls(config=config, storage=storage, providers=providers)
+        kit = cls(config=config, storage=storage, providers=providers, audit_hooks=audit_hooks)
         await kit.health_check()
         return kit

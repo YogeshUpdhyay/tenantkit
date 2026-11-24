@@ -2,7 +2,7 @@
 
 Async, framework-agnostic multi-tenancy, authentication and scoped impersonation for Python 3.11+.
 
-Install `pip install tenantkit` or `pip install 'tenantkit[sqlalchemy]'` for the async SQLAlchemy adapter. The host supplies keys, settings, database sessions and HTTP integration. The package reads no environment variables or files.
+Install `pip install tenantkit`, `pip install 'tenantkit[sqlalchemy]'` for the async SQLAlchemy adapter, or `pip install 'tenantkit[mongo]'` for the MongoDB adapter (Beanie 2.x). The host supplies keys, settings, database sessions and HTTP integration. The package reads no environment variables or files.
 
 Install directly from GitHub (requires Git):
 
@@ -14,6 +14,12 @@ With the async SQLAlchemy adapter:
 
 ```bash
 python -m pip install "tenantkit[sqlalchemy] @ git+https://github.com/YogeshUpdhyay/tenantkit.git@main"
+```
+
+With the MongoDB (Beanie) adapter:
+
+```bash
+python -m pip install "tenantkit[mongo] @ git+https://github.com/YogeshUpdhyay/tenantkit.git@main"
 ```
 
 Replace `main` with a tag or full commit SHA to pin a specific version.
@@ -63,15 +69,59 @@ async def setup():
     return renewed
 ```
 
-Access tokens remain valid until expiry after deactivation; login and refresh check current storage state. Refresh tokens are stateless and reusable in v1; revocation and password-change session termination are deferred. Never log tokens, passwords or key material.
+Never log tokens, passwords or key material.
 
-For SQLAlchemy, pass a host-created `async_sessionmaker` to `SqlAlchemyStorage(session_factory=Session, table_prefix="mt_")`. The adapter creates no engine and runs no migrations. Include its metadata in the host Alembic `target_metadata`; for a custom prefix use `storage.metadata`. Keep the prefix stable once migrations exist. `storage.transaction()` provides atomic multi-step operations. In-memory storage is intended for tests and local prototypes.
+### Sessions, logout and revocation
+
+Every login creates a session (`mt_sessions`). Refresh tokens rotate on every use; presenting an old refresh token again revokes the whole session (and any impersonation sessions started from it) and raises `RevokedTokenError`, a subclass of `InvalidTokenError`. Clients must serialise refresh calls: two refreshes racing with the same token end the session.
+
+```python
+await kit.admin_auth.logout(refresh_token=pair.refresh_token)       # idempotent
+await kit.tenant_auth.logout_all(actor=claims)                      # all of the user's sessions
+await kit.control_plane.revoke_sessions(actor, "tenant", user_id)   # needs sessions:revoke
+await kit.access.end_impersonation(refresh_token=imp.refresh_token)
+```
+
+Deactivating a user, admin or tenant and changing a password revoke the affected sessions. `kit.tokens.verify()` stays synchronous and storage-free, so a revoked session's access token is accepted until it expires (15 minutes by default). For instant cut-off on sensitive routes call `await kit.tokens.verify_active(token, expected="tenant")`. Schedule `await kit.sessions.purge_expired()` to clean up old rows. Details: [docs/10-sessions-revocation.md](docs/10-sessions-revocation.md).
+
+### Audit log
+
+tenantkit records an append-only audit trail (`mt_audit_events`) of logins, failed logins, lockouts, token reuse, logout, password changes, impersonation and every control-plane change, written in the same transaction as the change. Admins with `audit:read` call `await kit.audit.list(actor, action="tenant.*")`; `audit:purge` allows `await kit.audit.purge(actor, before=cutoff)`. Failed-login events omit the attempted email unless `audit.include_failed_login_email` is set. Hooks observe events after commit; a failing hook is logged and never affects the operation:
+
+```python
+async def forward_to_siem(event):
+    await siem.send({"action": event.action, "outcome": event.outcome, "actor": str(event.actor_id)})
+
+kit = TenantKit(config=config, storage=storage, audit_hooks=[forward_to_siem])
+```
+
+Do not call tenantkit operations inside a `storage.transaction()` you opened yourself. Details: [docs/11-audit.md](docs/11-audit.md).
+
+### Storage
+
+For SQLAlchemy, pass a host-created `async_sessionmaker` to `SqlAlchemyStorage(session_factory=Session, table_prefix="mt_")`. The adapter creates no engine and runs no migrations. Include its metadata in the host Alembic `target_metadata`; for a custom prefix use `storage.metadata`. Keep the prefix stable once migrations exist. **Upgrading from 0.1 adds the `mt_sessions` and `mt_audit_events` tables: run `alembic revision --autogenerate` and migrate before deploying 0.2.** `storage.transaction()` provides atomic multi-step operations. In-memory storage is intended for tests and local prototypes.
+
+For MongoDB (6.0+, replica set or mongos) the host owns `init_beanie`:
+
+```python
+from beanie import init_beanie
+from pymongo import AsyncMongoClient
+from tenantkit.storage.beanie import BeanieStorage, document_models
+
+client = AsyncMongoClient(MONGO_URL, uuidRepresentation="standard", tz_aware=True)
+db = client["app"]
+tk_models = document_models(prefix="mt_")  # once per process
+await init_beanie(database=db, document_models=[*app_models, *tk_models.all])
+kit = await TenantKit.create(config=config, storage=BeanieStorage(database=db, models=tk_models))
+```
+
+`health_check()` fails fast on a standalone server, a non-`standard` UUID representation, or models that were not initialised. Details: [docs/12-mongo-storage.md](docs/12-mongo-storage.md).
 
 ## FastAPI integration
 
 Install FastAPI and an ASGI server separately. Build one kit in the host startup/lifespan and call `create_app(kit)` below. With a SQLAlchemy engine, dispose the host engine on shutdown. The core has no framework dependency.
 
-The complete runnable host integration below is identical to [examples/fastapi_app/app.py](examples/fastapi_app/app.py). It includes authentication middleware, authorization dependencies, login and refresh routes, error mapping, tenant-scoped data and impersonation audit logging. `/tenant/profile` accepts tenant tokens only; `/orders` accepts tenant and impersonation tokens; `/admin/tenants` accepts admin tokens. The middleware resets its context variable after every request.
+The complete runnable host integration below is identical to [examples/fastapi_app/app.py](examples/fastapi_app/app.py). It includes authentication middleware, authorization dependencies, login, refresh, logout and logout-all routes, error mapping, tenant-scoped data, an audit-log route and impersonation audit logging. `/tenant/profile` accepts tenant tokens only; `/orders` accepts tenant and impersonation tokens; `/admin/tenants` and `/admin/audit` accept admin tokens; `/tenant/billing` also checks the session with `verify_active`, so a logged-out user is refused immediately. The middleware resets its context variable after every request.
 
 <!-- BEGIN FASTAPI EXAMPLE -->
 ```python
@@ -114,6 +164,10 @@ class Impersonate(BaseModel):
     role: str
     admin_refresh_token: SecretStr
     reason: str | None = None
+
+
+class Logout(BaseModel):
+    refresh_token: SecretStr
 
 
 class NewTenant(BaseModel):
@@ -177,6 +231,7 @@ def create_app(kit: TenantKit) -> FastAPI:
             (errors.WrongTokenTypeError, 403, "forbidden"),
             (errors.InvalidCredentialsError, 401, "invalid_credentials"),
             (errors.AccountLockedError, 403, "account_locked"),
+            (errors.RevokedTokenError, 401, "token_revoked"),
             (errors.InvalidTokenError, 401, "invalid_token"),
             (errors.PermissionDeniedError, 403, "forbidden"),
             (errors.ImpersonationDisabledError, 403, "forbidden"),
@@ -202,6 +257,17 @@ def create_app(kit: TenantKit) -> FastAPI:
             kit.access.require_type(claims, *types)
             if permission:
                 kit.access.require_permission(claims, permission)
+            return claims
+
+        return dependency
+
+    def require_active(*types: str) -> Any:
+        """Like ``require`` but also checks the session, for instant revocation."""
+
+        async def dependency(request: Request) -> Any:
+            token = request.headers.get("authorization", "").partition(" ")[2]
+            claims = await kit.tokens.verify_active(token, expected=set(types))
+            request.state.claims = claims
             return claims
 
         return dependency
@@ -240,6 +306,24 @@ def create_app(kit: TenantKit) -> FastAPI:
             refresh_token=body.refresh_token.get_secret_value()
         )
 
+    @app.post("/auth/logout")
+    async def logout(
+        body: Logout, claims: Any = Depends(require("admin", "tenant", "impersonation"))
+    ) -> Any:
+        token = body.refresh_token.get_secret_value()
+        if claims.typ == "admin":
+            await kit.admin_auth.logout(refresh_token=token)
+        elif claims.typ == "tenant":
+            await kit.tenant_auth.logout(refresh_token=token)
+        else:
+            await kit.access.end_impersonation(refresh_token=token)
+        return {"status": "logged_out"}
+
+    @app.post("/auth/logout-all")
+    async def logout_all(claims: Any = Depends(require("admin", "tenant"))) -> Any:
+        service = kit.admin_auth if claims.typ == "admin" else kit.tenant_auth
+        return {"revoked": await service.logout_all(actor=claims)}
+
     @app.post("/auth/impersonate")
     async def impersonate(body: Impersonate, claims: Any = Depends(require("admin"))) -> Any:
         return await kit.access.impersonate(
@@ -255,6 +339,20 @@ def create_app(kit: TenantKit) -> FastAPI:
         return await kit.control_plane.create_tenant(
             actor=claims, slug=body.slug, attributes=body.attributes
         )
+
+    @app.get("/admin/audit")
+    async def audit_events(
+        action: str | None = None,
+        tenant_id: UUID | None = None,
+        limit: int = 50,
+        claims: Any = Depends(require("admin")),
+    ) -> Any:
+        return await kit.audit.list(claims, action=action, tenant_id=tenant_id, limit=limit)
+
+    @app.get("/tenant/billing")
+    async def billing(claims: Any = Depends(require_active("tenant"))) -> Any:
+        # A sensitive route: a revoked session is refused immediately, not at token expiry.
+        return {"tenant_id": str(claims.tenant_id), "plan": "pro"}
 
     @app.get("/tenant/profile")
     async def profile(claims: Any = Depends(require("tenant"))) -> Any:
@@ -280,4 +378,4 @@ def create_app(kit: TenantKit) -> FastAPI:
 
 ## Development
 
-Install `pip install -e ".[dev]"`, then run `ruff check .`, `mypy`, and `pytest --cov=tenantkit`. CI runs these checks with PostgreSQL available. The requirements and deferred features are in `docs/`.
+Install `pip install -e ".[dev]"`, then run `ruff check .`, `mypy`, and `pytest --cov=tenantkit`. CI runs these checks with PostgreSQL and a single-node MongoDB replica set available (`TENANTKIT_TEST_DATABASE_URL`, `TENANTKIT_TEST_MONGO_URL`); MongoDB tests are skipped when the URL is unset. The requirements and deferred features are in `docs/`.
